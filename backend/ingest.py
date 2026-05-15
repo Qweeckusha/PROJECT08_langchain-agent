@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 import os
@@ -8,6 +9,7 @@ from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, SystemMessage
 
 import faiss
 from langchain_community.docstore.in_memory import InMemoryDocstore
@@ -16,6 +18,7 @@ from pydantic import BaseModel, Field, ValidationError
 from typing import Optional, Literal
 
 from . import models
+from .mcp_client import get_mcp_tools
 
 
 # ==========================================
@@ -31,7 +34,9 @@ BRAIN_FILE = os.path.join(PROJECT_ROOT, "brain.json")
 # ==========================================
 #         ИНИЦИАЛИЗАЦИЯ КОМПОНЕНТОВ
 # ==========================================
-print("ОК: Загрузка LangChain компонентов...")
+print("ОК: Загрузка компонентов BrAIn...")
+
+
 
 class IngestSchema(BaseModel):
     """Схема для парсинга входящих знаний"""
@@ -52,8 +57,12 @@ llm = ChatOpenAI(
     temperature=0.5,
     max_tokens=1024
 )
+mcp_tools = get_mcp_tools()
+router_llm = llm.bind_tools(mcp_tools)
 
 output_parser = StrOutputParser()
+
+print("ОК: Компоненты BrAIn...")
 
 # ==========================================
 #                  ПРОМПТЫ
@@ -189,6 +198,33 @@ def find_similar_lc(query_text: str, db: FAISS, threshold: float = 0.75, top_k: 
     return sorted(similar, key=lambda x: x["similarity"], reverse=True)
 
 
+async def unpack_input_async(raw_input: str) -> str:
+    """Асинхронная версия роутера. Вызывает MCP-инструменты через await."""
+    system_prompt = """Ты — помощник по подготовке данных.
+Если ввод выглядит как имя файла (например: 'lecture.pdf', 'notes.docx', '1.txt'), 
+вызови соответствующий инструмент (read_pdf, read_docx, read_text).
+Если это обычный текст для сохранения в базу — просто верни его в поле 'extracted_text'."""
+
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=raw_input)
+    ]
+
+    response = await router_llm.ainvoke(messages)
+
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        tool_call = response.tool_calls[0]
+        tool = next((t for t in mcp_tools if t.name == tool_call['name']), None)
+        if tool:
+            print(f"🔧 Вызываю инструмент: {tool_call['name']}({tool_call['args']})")
+            result = await tool.ainvoke(tool_call['args'])
+            if isinstance(result, str) and result.startswith("❌"):
+                raise ValueError(result)
+            return result
+
+    return response.content if hasattr(response, 'content') else str(response)
+
+
 def decide_with_llm_lc(new_text: str, existing_entries: list) -> str:
     """LangChain-версия валидации через LLM"""
     context = "\n".join([f"- {e['text']}" for e in existing_entries])
@@ -245,9 +281,37 @@ def save_knowledge_lc(parsed: IngestSchema, db: FAISS) -> str:
 # ==========================================
 #                 Контракт
 # ==========================================
+
+# Helper к основному контракту
+async def process_ingest_async(raw_input: str) -> dict:
+    """Асинхронная обёртка для FastAPI. Логика инжеста та же, только распаковка async."""
+    print(f'raw_input: {raw_input}')
+    if not raw_input or not raw_input.strip():
+        return {"status": "error", "message": "Пустой ввод", "data": None}
+
+    try:
+        print(f"🔍 Анализирую ввод: {raw_input[:50]}...")
+        # 🔹 Async-распаковка
+        text = await unpack_input_async(raw_input)
+        print(f'text: {text}, type: {type(text)}')
+        text = text[0]['text']
+
+        if not text or len(text.strip()) < 10:
+            return {"status": "error", "message": "Не удалось извлечь текст", "data": None}
+
+        print(f"✅ Извлечено {len(text)} символов. Передаю в пайплайн...")
+
+        # 🔹 Далее вызываем твою старую sync-функцию, она отлично работает внутри async
+        return process_ingest(text)
+
+    except Exception as e:
+        print(f"❌ Async Ingest Error: {e}")
+        return {"status": "error", "message": str(e), "data": None}
+
+
 def process_ingest(text: str) -> dict:
     if not text or not text.strip():
-        return {"status": "error", "message": "Пустой текст", "data": None}
+        return {"status": "error", "message": "Пустой ввод", "data": None}
 
     try:
         parsed = parse_chain.invoke({"input": text})
