@@ -5,13 +5,15 @@ from datetime import datetime
 
 import numpy as np
 from langchain_openai import ChatOpenAI
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 import faiss
 from langchain_community.docstore.in_memory import InMemoryDocstore
+
+from pydantic import BaseModel, Field, ValidationError
+from typing import Optional, Literal
 
 from . import models
 
@@ -30,6 +32,16 @@ BRAIN_FILE = os.path.join(PROJECT_ROOT, "brain.json")
 #         ИНИЦИАЛИЗАЦИЯ КОМПОНЕНТОВ
 # ==========================================
 print("ОК: Загрузка LangChain компонентов...")
+
+class IngestSchema(BaseModel):
+    """Схема для парсинга входящих знаний"""
+    text: str = Field(..., description="Основной смысл, структурированный текст")
+    topic: str = Field(..., description="Общая тема (например: ML.classification)")
+    subtopic: Optional[str] = Field(None, description="Уточнение темы")
+    tags: list[str] = Field(default_factory=list, description="Список тегов")
+    level: Literal["beginner", "intermediate", "advanced"] = Field("intermediate", description="Уровень сложности")
+    status: Literal["draft"] = "draft"
+    related_ids: list[str] = Field(default_factory=list, description="ID связанных записей")
 
 embeddings = models.embeddings
 
@@ -52,7 +64,7 @@ PARSE_PROMPT = ChatPromptTemplate.from_messages([
 Верни ТОЛЬКО валидный JSON без markdown и пояснений. Если информации нет, верни пустой объект {{}}.
 
 Требуемая структура JSON:
-{{
+{{ 
   "text": "основная мысль, можно структурировать, но не удалять важные детали",
   "topic": "общая тема, например: ML.classification.RandomForest (макс. 2 уровня, через точку)",
   "subtopic": "уточнение темы, можно микс русского и английского",
@@ -86,7 +98,7 @@ VALIDATE_PROMPT = ChatPromptTemplate.from_messages([
 #                  CHAINS
 # ==========================================
 
-parse_chain = PARSE_PROMPT | llm | output_parser
+parse_chain = PARSE_PROMPT | llm.with_structured_output(IngestSchema)
 validate_chain = VALIDATE_PROMPT | llm | output_parser
 
 
@@ -190,28 +202,27 @@ def decide_with_llm_lc(new_text: str, existing_entries: list) -> str:
         return decision if decision in ["duplicate", "complement", "new"] else "new"
     except Exception as e:
         print(f"⚠️ Ошибка валидации: {e}")
-        return "new"  # При ошибке — сохраняем, лучше продублировать
+        return "new"
 
 
-def save_knowledge_lc(parsed: dict, db: FAISS) -> str:
+def save_knowledge_lc(parsed: IngestSchema, db: FAISS) -> str:
     """
     Сохраняет запись в brain.json и обновляет FAISS индекс.
     Возвращает ID новой записи.
     """
     entry_id = str(uuid.uuid4())
-    related = parsed.get("related_ids", [])
 
     # Схема записи в brain
     entry = {
         "id": entry_id,
-        "text": parsed["text"],
-        "topic": parsed["topic"],
-        "subtopic": parsed["subtopic"],
-        "tags": parsed["tags"],
-        "level": parsed.get("level", "intermediate"),
-        "status": "draft",
+        "text": parsed.text,
+        "topic": parsed.topic,
+        "subtopic": parsed.subtopic,
+        "tags": parsed.tags,
+        "level": parsed.level,
+        "status": parsed.status,
         "created": datetime.now().isoformat(),
-        "related_ids": related
+        "related_ids": parsed.related_ids
     }
 
     # Сохраняем в brain.json
@@ -221,8 +232,8 @@ def save_knowledge_lc(parsed: dict, db: FAISS) -> str:
 
     # Добавляем в векторный индекс (FAISS)
     db.add_texts(
-        texts=[parsed["text"]],
-        metadatas=[{"id": entry_id, "topic": parsed["topic"]}],
+        texts=[parsed.text],
+        metadatas=[{"id": entry_id, "topic": parsed.topic}],
         ids=[entry_id]
     )
     db.save_local(FAISS_INDEX)
@@ -235,32 +246,20 @@ def save_knowledge_lc(parsed: dict, db: FAISS) -> str:
 #                 Контракт
 # ==========================================
 def process_ingest(text: str) -> dict:
-    """
-    Принимает текст, обрабатывает его и сохраняет в базу.
-    Возвращает JSON со статусом для фронтенда.
-    Полностью повторяет логику твоего main(), но без input/print.
-    """
     if not text or not text.strip():
         return {"status": "error", "message": "Пустой текст", "data": None}
 
     try:
-        # 1. Парсинг (как в main)
-        raw_response = parse_chain.invoke({"input": text})
-        clean = raw_response.strip().replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(clean)
+        parsed = parse_chain.invoke({"input": text})
+        if not parsed or not parsed.text:
+            return {"status": "error", "message": "Модель не смогла извлечь текст", "data": None}
 
-        if not parsed or not all(k in parsed for k in ["text", "topic", "tags"]):
-            return {"status": "error", "message": "Не удалось распарсить JSON", "data": parsed}
-
-        # 2. Загрузка/создание базы (как в main)
         if not os.path.exists(FAISS_INDEX):
             db = rebuild_faiss_index()
         else:
             db = FAISS.load_local(FAISS_INDEX, embeddings, allow_dangerous_deserialization=True)
 
-        # 3. Поиск связей (используем ТВОЮ функцию с порогом 0.75)
-        similar = find_similar_lc(parsed["text"], db, threshold=0.75)
-
+        similar = find_similar_lc(parsed.text, db, threshold=0.75)
         best_match = None
 
         if not similar:
@@ -269,18 +268,16 @@ def process_ingest(text: str) -> dict:
             best_match = similar[0]
             score = best_match['similarity']
 
-            # ТВОЯ логика порогов (0.90 / 0.75)
             if score > 0.90:
-                decision = decide_with_llm_lc(parsed["text"], similar)
+                decision = decide_with_llm_lc(parsed.text, similar)
             elif score > 0.75:
                 decision = "complement"
-                if "related_ids" not in parsed:
-                    parsed["related_ids"] = []
-                parsed["related_ids"].append(best_match["id"])
+                if not parsed.related_ids:
+                    parsed.related_ids = []
+                parsed.related_ids.append(best_match["id"])
             else:
                 decision = "new"
 
-        # 4. Действие
         if decision == "duplicate":
             return {
                 "status": "duplicate",
@@ -288,25 +285,22 @@ def process_ingest(text: str) -> dict:
                 "data": {"match": best_match["text"][:50] + "..."}
             }
 
-        # 5. Сохранение (твоя функция)
         entry_id = save_knowledge_lc(parsed, db)
 
-        # 6. Успешный ответ для фронтенда
         return {
             "status": "success",
             "message": f"Запись сохранена ({decision}).",
             "data": {
                 "id": entry_id,
-                "topic": parsed["topic"],
+                "topic": parsed.topic,
                 "decision": decision,
                 "related_to": best_match["text"][:50] + "..." if best_match and decision == "complement" else None
             }
         }
 
-    except json.JSONDecodeError as e:
-        return {"status": "error", "message": f"Ошибка JSON: {e}", "data": None}
+    except ValidationError as e:
+        return {"status": "error", "message": f"Ошибка структуры данных: {e}", "data": None}
     except Exception as e:
-        # Логируем в консоль сервера, но не ломаем ответ
         print(f"❌ Ingest Error: {e}")
         return {"status": "error", "message": str(e), "data": None}
 

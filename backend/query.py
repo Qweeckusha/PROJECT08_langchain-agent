@@ -2,13 +2,14 @@ import json
 from operator import itemgetter
 import os
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.runnables import RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
 from . import models
+from .skills import detect_skills, get_skills_prompt
+from .ingest import rebuild_faiss_index
 
 
 # ==========================================
@@ -21,7 +22,12 @@ FAISS_INDEX = os.path.join(PROJECT_ROOT, "faiss_index")
 
 embeddings = models.embeddings
 
-db = FAISS.load_local(FAISS_INDEX, embeddings, allow_dangerous_deserialization=True)
+if not os.path.exists(FAISS_INDEX) or not os.path.exists(os.path.join(FAISS_INDEX, "index.faiss")):
+    print("⚠️ FAISS-индекс не найден. Создаю новый...")
+    db = rebuild_faiss_index()
+else:
+    db = FAISS.load_local(FAISS_INDEX, embeddings, allow_dangerous_deserialization=True)
+
 retriever = db.as_retriever(search_kwargs={"k": 5})
 print("ОК: База загружена из 'faiss_index'.")
 
@@ -41,24 +47,26 @@ llm = ChatOpenAI(
 # ==========================================
 
 prompt = ChatPromptTemplate.from_template("""Ты — опытный наставник по Machine Learning. 
-Твоя задача — объяснять концепции простым языком, опираясь СТРОГО на предоставленный контекст. 
-Записи из контекста нужно будет связать между собой, если это возможно. 
-
+Твоя задача — объяснять концепции простым языком, опираясь СТРОГО на предоставленный контекст.
+Записи из контекста нужно будет связать между собой, если это возможно.
 Ты можешь использовать весь контекст, но важно определить релевантные вопросу части контекста. То есть обсуждение двух разных тем просто недопустимо.
 
 ПРАВИЛА ОТВЕТА:
-1. Объясняй своими словами, не копируй текст дословно.
-2. Используй аналогии и примеры, если они уместны.
-3. Структурируй ответ: короткое определение → суть → пример/применение.
-4. Если в контексте нет ответа, честно скажи: "В базе пока нет информации об этом".
-5. Не выдумывай факты и не добавляй знания извне.
-6. Старайся дать максимально полный ответ.
-7. Если пользователь просит ответить кратко, то постарайся ужать информацию.
+Объясняй своими словами, не копируй текст дословно.
+Используй аналогии и примеры, если они уместны.
+Структурируй ответ: короткое определение → суть → пример/применение.
+Если в контексте нет ответа, честно скажи: "В базе пока нет информации об этом".
+Не выдумывай факты и не добавляй знания извне.
+Старайся дать максимально полный ответ.
+Если пользователь просит ответить кратко, то постарайся ужать информацию.
 
 СТОП-СЛОВА:
 - Не начинай с фраз вроде "На основе контекста...", "В предоставленных данных...".
 - Не перечисляй источники списком.
 - Избегай сложных терминов без пояснений.
+
+ДОПОЛНИТЕЛЬНЫЕ ИНСТРУКЦИИ (активны только если указаны ниже):
+{skills}
 
 КОНТЕКСТ (база знаний):
 {context}
@@ -78,7 +86,8 @@ chain = (
         "context": itemgetter("question") | retriever | RunnableLambda(format_docs),
 
         # 2. Берем ту же строку из ключа "question" -> отдаем в переменную {question} промпта
-        "question": itemgetter("question")
+        "question": itemgetter("question"),
+        "skills": itemgetter("skills")
     }
     | prompt
     | llm
@@ -96,7 +105,13 @@ def stream_query(question: str):
         return
 
     try:
-        # 1. Получаем источники СРАЗУ (чтобы фронтенд мог отрисовать сайдбар)
+
+        active_skills = detect_skills(question)
+        skills_block = get_skills_prompt(active_skills)
+
+        if active_skills:
+            print(f"🔧 Активированы скиллы: {active_skills}")
+
         docs = retriever.invoke(question)
         sources = []
         for doc in docs:
@@ -121,8 +136,13 @@ def stream_query(question: str):
             yield 'event: done\ndata: {}\n\n'
             return
 
+        input_data = {
+            "question": question,
+            "skills": skills_block
+        }
+
         # Стримим ответ модели по чанкам (~токенам)
-        for chunk in chain.stream({"question": question}):
+        for chunk in chain.stream(input_data):
             if chunk:
                 yield f'event: answer\ndata: {chunk}\n\n'
 
