@@ -22,17 +22,16 @@ function updateUI(mode) {
 }
 
 async function handleSubmit(e) {
-  if (e) { e.preventDefault(); e.stopPropagation(); }
+  if (e) e.preventDefault();
   const text = els.userInput?.value.trim();
   if (!text) return;
 
   const mode = document.body.dataset.mode || 'read';
-  if (els.userInput) els.userInput.disabled = true;
-  if (els.sendBtn) els.sendBtn.disabled = true;
-  if (els.sendBtn) els.sendBtn.textContent = '⏳';
-  if (els.output) {
-    els.output.innerHTML = mode === 'read' ? '<p class="placeholder">🔍 Ищу...</p>' : '<p class="placeholder">⏳ Сохраняю...</p>';
-  }
+  els.userInput.disabled = true;
+  els.sendBtn.disabled = true;
+  els.sendBtn.textContent = '⏳';
+
+  if (els.output) els.output.innerHTML = mode === 'read' ? '<p class="placeholder">🔍 Ищу...</p>' : '<p class="placeholder">⏳ Сохраняю...</p>';
   if (els.sourcesList) els.sourcesList.innerHTML = '';
 
   try {
@@ -44,7 +43,11 @@ async function handleSubmit(e) {
     if (els.output) els.output.innerHTML = '<p style="color: var(--text-muted);">❌ Сбой</p>';
   } finally {
     if (els.userInput) { els.userInput.disabled = false; els.userInput.value = ''; els.userInput.focus(); }
-    if (els.sendBtn) { els.sendBtn.disabled = false; els.sendBtn.textContent = mode === 'read' ? 'Отправить' : 'Сохранить'; }
+    // Разблокируем кнопку всегда, но текст меняем только если это не статус успеха
+    if (els.sendBtn) els.sendBtn.disabled = false;
+    if (els.sendBtn && !els.sendBtn.textContent.includes('✓')) {
+      els.sendBtn.textContent = mode === 'read' ? 'Отправить' : 'Сохранить';
+    }
   }
 }
 
@@ -66,7 +69,6 @@ async function handleQueryStream(question) {
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-
     buffer += decoder.decode(value, { stream: true });
     const events = buffer.split('\n\n');
     buffer = events.pop();
@@ -88,14 +90,13 @@ async function handleQueryStream(question) {
       else if (type === 'answer') {
         answerBuffer += data;
         if (els.output) {
-          els.output.innerHTML = marked.parse(answerBuffer);
+          // Передаём опции прямо в parse (современный подход для marked v5+)
+          els.output.innerHTML = marked.parse(answerBuffer, { breaks: true, gfm: true });
           els.output.scrollTop = els.output.scrollHeight;
         }
-      }
-      else if (type === 'done') {
+      } else if (type === 'done') {
         if (els.sendBtn) els.sendBtn.textContent = 'Готово ✓';
-      }
-      else if (type === 'error') {
+      } else if (type === 'error') {
         showAlert(JSON.parse(data).message, 'error');
       }
     }
@@ -109,12 +110,12 @@ function renderSources(sources) {
     return;
   }
   // ✅ Исправлен синтаксис шаблонных строк
-  els.sourcesList.innerHTML = sources.map(src =>
-    `<div class="source-card">
-       <div class="source-topic">${src.topic || 'info'}</div>
-       <div class="source-preview">${src.preview}</div>
-     </div>`
-  ).join('');
+  els.sourcesList.innerHTML = sources.map(src => `
+    <div class="source-card">
+      <div class="source-topic">${src.topic || 'info'}</div>
+      <div class="source-preview">${src.preview}</div>
+    </div>
+  `).join('');
 }
 
 async function handleIngestRequest(text) {
@@ -127,11 +128,11 @@ async function handleIngestRequest(text) {
   const status = data.status === 'success' ? 'success' :
                  data.status === 'duplicate' ? 'duplicate' : 'error';
   showAlert(data.message, status);
-
   if (els.output) {
-    // ✅ Исправлен синтаксис
     els.output.innerHTML = `<p>${data.message}</p>${data.data?.topic ? `<p class="placeholder" style="margin-top:8px">Тема: ${data.data.topic}</p>` : ''}`;
   }
+  // Добавил статус успеха и для режима записи, чтобы finally не сбрасывал его
+  if (els.sendBtn) els.sendBtn.textContent = 'Готово ✓';
 }
 
 function showAlert(msg, type) {
@@ -143,26 +144,17 @@ function showAlert(msg, type) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  // ✅ Настройки marked применяются только когда DOM и библиотека готовы
-  if (typeof marked !== 'undefined') {
-    marked.setOptions({ breaks: false, gfm: true, pedantic: false });
-  }
-
   initElements();
   updateUI('read');
-
   els.modeRadios?.forEach(radio => {
     radio.addEventListener('change', e => updateUI(e.target.value));
   });
-
   if (els.chatForm) els.chatForm.addEventListener('submit', handleSubmit);
-
   els.userInput?.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       els.chatForm?.requestSubmit();
     }
   });
-
   els.userInput?.focus();
 });

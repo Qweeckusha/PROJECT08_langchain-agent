@@ -146,7 +146,7 @@ def stream_query(question: str):
         # Стримим ответ модели по чанкам (~токенам)
         for chunk in chain.stream(input_data):
             if chunk:
-                yield f'event: answer\ndata:{chunk}\n\n\n'
+                yield f'event: answer\ndata:{chunk}\n\n'
 
     except Exception as e:
         print(f"❌ Stream Error: {e}")
